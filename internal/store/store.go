@@ -4,6 +4,7 @@
 package store
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -108,6 +109,19 @@ func (s *Store) Delete(key string) bool {
 	}
 	delete(s.entries, key)
 	return true
+}
+
+// Keys returns the keys currently stored, sorted, including keys
+// that have expired but not yet been swept.
+func (s *Store) Keys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0, len(s.entries))
+	for key := range s.entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // Len returns the number of keys currently stored, including keys
