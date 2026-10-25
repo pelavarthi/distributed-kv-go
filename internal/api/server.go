@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
+	"github.com/pelavarthi/distributed-kv-go/internal/wal"
 )
 
 type putRequest struct {
@@ -25,14 +26,21 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// Server is an http.Handler around a store.
+// Server is an http.Handler around a store. When log is set, every
+// mutation is appended to the log before it touches the store.
 type Server struct {
 	store *store.Store
+	log   *wal.Log
 	mux   *http.ServeMux
 }
 
 func New(s *store.Store) *Server {
-	srv := &Server{store: s, mux: http.NewServeMux()}
+	return NewWithLog(s, nil)
+}
+
+// NewWithLog is New with a write-ahead log for durability.
+func NewWithLog(s *store.Store, log *wal.Log) *Server {
+	srv := &Server{store: s, log: log, mux: http.NewServeMux()}
 	srv.mux.HandleFunc("/health", srv.handleHealth)
 	srv.mux.HandleFunc("/kv", srv.handleList)
 	srv.mux.HandleFunc("/kv/", srv.handleKey)
@@ -86,6 +94,12 @@ func (s *Server) handleKey(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, keyResponse{Key: key, Value: value})
 	case http.MethodDelete:
+		if s.log != nil {
+			if err := s.log.AppendDelete(key); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to write log")
+				return
+			}
+		}
 		if !s.store.Delete(key) {
 			writeError(w, http.StatusNotFound, "key not found")
 			return
@@ -107,7 +121,14 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 	_, existed := s.store.Get(key)
-	s.store.Set(key, req.Value, time.Duration(req.TTLSeconds)*time.Second)
+	ttl := time.Duration(req.TTLSeconds) * time.Second
+	if s.log != nil {
+		if err := s.log.AppendSet(key, req.Value, ttl); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to write log")
+			return
+		}
+	}
+	s.store.Set(key, req.Value, ttl)
 	status := http.StatusOK
 	if !existed {
 		status = http.StatusCreated

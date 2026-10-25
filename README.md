@@ -7,6 +7,10 @@ Run the server:
 go run ./cmd/server
 ```
 
+Every write is appended to `data/wal.log` and synced before it is
+applied, and the log is replayed on startup, so data survives a
+restart. Use `-data-dir` to put the log somewhere else.
+
 HTTP API:
 
 ```
