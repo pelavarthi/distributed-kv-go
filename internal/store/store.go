@@ -100,6 +100,44 @@ func (s *Store) Get(key string) (string, bool) {
 	return e.value, true
 }
 
+// Entry is one key as it appears in a snapshot. ExpiresAt is
+// meaningful only when HasTTL is true, and it is an absolute time,
+// so restoring an entry does not give the key a fresh lifetime.
+type Entry struct {
+	Key       string
+	Value     string
+	ExpiresAt time.Time
+	HasTTL    bool
+}
+
+// Entries returns the live keys, sorted, for snapshotting. Expired
+// keys are left out instead of waiting for the next sweep.
+func (s *Store) Entries() []Entry {
+	now := time.Now()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entries := make([]Entry, 0, len(s.entries))
+	for key, e := range s.entries {
+		if e.hasTTL && now.After(e.expiresAt) {
+			continue
+		}
+		entries = append(entries, Entry{Key: key, Value: e.value, ExpiresAt: e.expiresAt, HasTTL: e.hasTTL})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries
+}
+
+// Restore inserts an entry exactly as snapshotted, keeping its
+// original expiry. Entries that already expired are ignored.
+func (s *Store) Restore(e Entry) {
+	if e.HasTTL && time.Now().After(e.ExpiresAt) {
+		return
+	}
+	s.mu.Lock()
+	s.entries[e.Key] = entry{value: e.Value, expiresAt: e.ExpiresAt, hasTTL: e.HasTTL}
+	s.mu.Unlock()
+}
+
 // Delete removes key and reports whether it was present.
 func (s *Store) Delete(key string) bool {
 	s.mu.Lock()
