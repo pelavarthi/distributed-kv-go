@@ -1,4 +1,4 @@
-// Command kvctl talks to a running server: get, set, delete, list.
+// Command kvctl talks to a running server: get, set, delete, list, members.
 package main
 
 import (
@@ -15,7 +15,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: kvctl [-addr URL] [-ttl SECONDS] <get|set|delete|list> [key] [value]")
+		fmt.Fprintln(os.Stderr, "usage: kvctl [-addr URL] [-ttl SECONDS] <get|set|delete|list|members> [key] [value]")
 		os.Exit(2)
 	}
 	c := client.New(*addr)
@@ -49,6 +49,18 @@ func main() {
 		if err == nil {
 			for _, key := range keys {
 				fmt.Println(key)
+			}
+		}
+	case "members":
+		var members []client.Member
+		members, err = c.Members()
+		if err == nil {
+			for _, m := range members {
+				status := "dead"
+				if m.Alive {
+					status = "alive"
+				}
+				fmt.Printf("%s %s %s\n", m.ID, m.Addr, status)
 			}
 		}
 	default:

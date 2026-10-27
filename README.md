@@ -28,4 +28,21 @@ go run ./cmd/kvctl set hello world
 go run ./cmd/kvctl get hello
 go run ./cmd/kvctl list
 go run ./cmd/kvctl delete hello
+go run ./cmd/kvctl members
+```
+
+Cluster membership:
+
+Each node heartbeats its peers once a second and marks a peer
+dead after 3 seconds without a heartbeat. A peer that starts
+answering again is marked alive again.
+
+```
+go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -peers http://localhost:8081
+go run ./cmd/server -id node2 -listen :8081 -advertise http://localhost:8081 -peers http://localhost:8080 -data-dir data2
+```
+
+```
+POST /cluster/heartbeat  {"id": "node1", "addr": "http://localhost:8080"}
+GET /cluster/members
 ```

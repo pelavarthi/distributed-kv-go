@@ -105,6 +105,31 @@ func (c *Client) List() ([]string, error) {
 	return out.Keys, nil
 }
 
+// Member is one node from the /cluster/members endpoint.
+type Member struct {
+	ID    string `json:"id"`
+	Addr  string `json:"addr"`
+	Alive bool   `json:"alive"`
+}
+
+func (c *Client) Members() ([]Member, error) {
+	req, err := http.NewRequest(http.MethodGet, c.base+"/cluster/members", nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Members []Member `json:"members"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return out.Members, nil
+}
+
 func (c *Client) Health() error {
 	req, err := http.NewRequest(http.MethodGet, c.base+"/health", nil)
 	if err != nil {
