@@ -3,7 +3,8 @@
 // write-ahead log, so keys written before a restart come back
 // without replaying the whole history every time. With -peers it
 // also joins a cluster: it heartbeats its peers and serves its
-// membership list, so nodes can tell when one has gone quiet.
+// membership list, so nodes can tell when one has gone quiet,
+// and the alive member with the highest id is the leader.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/pelavarthi/distributed-kv-go/internal/api"
 	"github.com/pelavarthi/distributed-kv-go/internal/cluster"
+	"github.com/pelavarthi/distributed-kv-go/internal/election"
 	"github.com/pelavarthi/distributed-kv-go/internal/snapshot"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 	"github.com/pelavarthi/distributed-kv-go/internal/wal"
@@ -55,10 +57,13 @@ func main() {
 	c.Start()
 	defer c.Stop()
 
+	e := election.New(*nodeID)
+
 	mux := http.NewServeMux()
 	mux.Handle("/", api.NewWithLog(s, l))
 	mux.HandleFunc("/cluster/heartbeat", c.HandleHeartbeat)
 	mux.HandleFunc("/cluster/members", c.HandleMembers)
+	mux.HandleFunc("/cluster/leader", e.HandleLeader(c.Members))
 
 	log.Printf("node %s listening on %s, peers: %v", *nodeID, *listen, peerAddrs)
 	if err := http.ListenAndServe(*listen, mux); err != nil {

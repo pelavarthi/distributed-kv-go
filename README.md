@@ -29,6 +29,7 @@ go run ./cmd/kvctl get hello
 go run ./cmd/kvctl list
 go run ./cmd/kvctl delete hello
 go run ./cmd/kvctl members
+go run ./cmd/kvctl leader
 ```
 
 Cluster membership:
@@ -36,6 +37,16 @@ Cluster membership:
 Each node heartbeats its peers once a second and marks a peer
 dead after 3 seconds without a heartbeat. A peer that starts
 answering again is marked alive again.
+
+Leader election:
+
+The alive member with the highest id is the leader, so every
+node that sees the same membership list picks the same leader.
+When the leader goes quiet, the next-highest alive member takes
+over, and the term number goes up by one on each change. Check
+it with `kvctl leader` or `GET /cluster/leader`. This is a
+simplified election: it decides who leads, but it has no vote
+rounds, so it cannot yet be trusted to commit writes on its own.
 
 ```
 go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -peers http://localhost:8081
