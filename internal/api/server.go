@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pelavarthi/distributed-kv-go/internal/replication"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 	"github.com/pelavarthi/distributed-kv-go/internal/wal"
 )
@@ -28,10 +29,16 @@ type errorResponse struct {
 
 // Server is an http.Handler around a store. When log is set, every
 // mutation is appended to the log before it touches the store.
+// When repl is set, writes go through replication instead: only
+// the leader accepts them, and a write is applied only after a
+// majority of nodes hold it. Reads still serve from the local
+// store, which holds every committed write.
 type Server struct {
-	store *store.Store
-	log   *wal.Log
-	mux   *http.ServeMux
+	store  *store.Store
+	log    *wal.Log
+	mux    *http.ServeMux
+	repl   *replication.Replicator
+	leader func() (bool, int) // isLeader, term
 }
 
 func New(s *store.Store) *Server {
@@ -45,6 +52,42 @@ func NewWithLog(s *store.Store, log *wal.Log) *Server {
 	srv.mux.HandleFunc("/kv", srv.handleList)
 	srv.mux.HandleFunc("/kv/", srv.handleKey)
 	return srv
+}
+
+// NewWithReplication is NewWithLog with a replicator. The leader
+// function reports whether this node currently leads and its term;
+// the replicator's apply function, set by the caller, is what
+// writes committed entries to the log and store.
+func NewWithReplication(s *store.Store, log *wal.Log, repl *replication.Replicator, leader func() (bool, int)) *Server {
+	srv := NewWithLog(s, log)
+	srv.repl = repl
+	srv.leader = leader
+	srv.mux.HandleFunc("/cluster/replicate", srv.handleReplicate)
+	return srv
+}
+
+// HandleReplicate serves POST /cluster/replicate for followers.
+// It is also registered by the server binary alongside the other
+// cluster endpoints, so a replicator can be reached directly.
+func (s *Server) HandleReplicate(w http.ResponseWriter, r *http.Request) {
+	s.handleReplicate(w, r)
+}
+
+func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
+	if s.repl == nil {
+		writeError(w, http.StatusNotFound, "replication is not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req replication.AppendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.repl.Receive(req))
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -94,6 +137,10 @@ func (s *Server) handleKey(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, keyResponse{Key: key, Value: value})
 	case http.MethodDelete:
+		if s.repl != nil {
+			s.handleReplicatedDelete(w, key)
+			return
+		}
 		if s.log != nil {
 			if err := s.log.AppendDelete(key); err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to write log")
@@ -110,6 +157,39 @@ func (s *Server) handleKey(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// checkLeader reports whether this node may accept a write. A
+// follower answers 503 so a client can retry on the leader.
+func (s *Server) checkLeader(w http.ResponseWriter) (int, bool) {
+	isLeader, term := true, 0
+	if s.leader != nil {
+		isLeader, term = s.leader()
+	}
+	if !isLeader {
+		writeError(w, http.StatusServiceUnavailable, "not leader")
+		return 0, false
+	}
+	return term, true
+}
+
+func (s *Server) handleReplicatedDelete(w http.ResponseWriter, key string) {
+	if _, ok := s.store.Get(key); !ok {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	term, ok := s.checkLeader(w)
+	if !ok {
+		return
+	}
+	index := s.repl.Append(replication.OpDelete, key, "", time.Time{}, false, term)
+	if !s.repl.Replicate(index) {
+		writeError(w, http.StatusServiceUnavailable, "could not reach a majority of followers")
+		return
+	}
+	s.repl.Commit(index)
+	s.repl.SyncCommit()
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	var req putRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -121,6 +201,30 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 	_, existed := s.store.Get(key)
+	if s.repl != nil {
+		term, ok := s.checkLeader(w)
+		if !ok {
+			return
+		}
+		var expiresAt time.Time
+		hasTTL := req.TTLSeconds > 0
+		if hasTTL {
+			expiresAt = time.Now().Add(time.Duration(req.TTLSeconds) * time.Second)
+		}
+		index := s.repl.Append(replication.OpSet, key, req.Value, expiresAt, hasTTL, term)
+		if !s.repl.Replicate(index) {
+			writeError(w, http.StatusServiceUnavailable, "could not reach a majority of followers")
+			return
+		}
+		s.repl.Commit(index)
+		s.repl.SyncCommit()
+		status := http.StatusOK
+		if !existed {
+			status = http.StatusCreated
+		}
+		writeJSON(w, status, keyResponse{Key: key, Value: req.Value})
+		return
+	}
 	ttl := time.Duration(req.TTLSeconds) * time.Second
 	if s.log != nil {
 		if err := s.log.AppendSet(key, req.Value, ttl); err != nil {

@@ -8,6 +8,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -18,6 +20,7 @@ import (
 	"github.com/pelavarthi/distributed-kv-go/internal/api"
 	"github.com/pelavarthi/distributed-kv-go/internal/cluster"
 	"github.com/pelavarthi/distributed-kv-go/internal/election"
+	"github.com/pelavarthi/distributed-kv-go/internal/replication"
 	"github.com/pelavarthi/distributed-kv-go/internal/snapshot"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 	"github.com/pelavarthi/distributed-kv-go/internal/wal"
@@ -59,11 +62,66 @@ func main() {
 
 	e := election.New(*nodeID)
 
+	// Replication: the leader appends each write to its log and
+	// sends it to alive followers; a write is applied only after
+	// a majority holds it. Applying a committed entry means
+	// writing it to this node's WAL first, then to its store,
+	// the same order the single-node path already used.
+	repl := replication.New(*nodeID)
+	repl.SetApply(func(en replication.Entry) {
+		if en.Op == replication.OpDelete {
+			_ = l.AppendDelete(en.Key)
+			s.Delete(en.Key)
+			return
+		}
+		_ = l.AppendSetWithExpiry(en.Key, en.Value, en.ExpiresAt)
+		s.Restore(store.Entry{Key: en.Key, Value: en.Value, ExpiresAt: en.ExpiresAt, HasTTL: en.HasTTL})
+	})
+	repl.SetPeers(func() []string {
+		var addrs []string
+		for _, m := range c.Members() {
+			if m.Alive && m.Addr != *advertise {
+				addrs = append(addrs, m.Addr)
+			}
+		}
+		return addrs
+	})
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	repl.SetSender(func(addr string, req replication.AppendRequest) (replication.AppendResponse, error) {
+		body, _ := json.Marshal(req)
+		resp, err := httpClient.Post(addr+"/cluster/replicate", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return replication.AppendResponse{}, err
+		}
+		defer resp.Body.Close()
+		var out replication.AppendResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return replication.AppendResponse{}, err
+		}
+		return out, nil
+	})
+	leaderFn := func() (bool, int) {
+		e.Refresh(c.Members())
+		_, term := e.Leader()
+		return e.IsLeader(), term
+	}
+	apiServer := api.NewWithReplication(s, l, repl, leaderFn)
+
 	mux := http.NewServeMux()
-	mux.Handle("/", api.NewWithLog(s, l))
+	mux.Handle("/", apiServer)
 	mux.HandleFunc("/cluster/heartbeat", c.HandleHeartbeat)
 	mux.HandleFunc("/cluster/members", c.HandleMembers)
 	mux.HandleFunc("/cluster/leader", e.HandleLeader(c.Members))
+	mux.HandleFunc("/cluster/replicate", apiServer.HandleReplicate)
+	mux.HandleFunc("/cluster/replication", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		leader, _ := e.Refresh(c.Members())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(repl.Status(leader))
+	})
 
 	log.Printf("node %s listening on %s, peers: %v", *nodeID, *listen, peerAddrs)
 	if err := http.ListenAndServe(*listen, mux); err != nil {

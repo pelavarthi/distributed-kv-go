@@ -48,6 +48,19 @@ it with `kvctl leader` or `GET /cluster/leader`. This is a
 simplified election: it decides who leads, but it has no vote
 rounds, so it cannot yet be trusted to commit writes on its own.
 
+Log replication:
+
+Only the leader accepts writes. It appends each write to its
+replication log, sends it to every alive follower
+(`POST /cluster/replicate`), and applies it only once a
+majority of nodes hold it, then tells the followers the write
+committed so they apply it too. A write to a follower answers
+503, and a write that cannot reach a majority is left
+uncommitted and never applied. Check the state with
+`GET /cluster/replication`. A follower that missed earlier
+entries rejects a new one until it catches up, which is the
+next chunk's job.
+
 ```
 go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -peers http://localhost:8081
 go run ./cmd/server -id node2 -listen :8081 -advertise http://localhost:8081 -peers http://localhost:8080 -data-dir data2
