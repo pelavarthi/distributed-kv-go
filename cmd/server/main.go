@@ -103,6 +103,12 @@ func main() {
 	leaderFn := func() (bool, int) {
 		e.Refresh(c.Members())
 		_, term := e.Leader()
+		if e.IsLeader() {
+			// A new leader adopts the election term, so its
+			// appends are not rejected as stale by followers
+			// that already saw the handover.
+			repl.NoteTerm(term)
+		}
 		return e.IsLeader(), term
 	}
 	apiServer := api.NewWithReplication(s, l, repl, leaderFn)
@@ -113,6 +119,7 @@ func main() {
 	mux.HandleFunc("/cluster/members", c.HandleMembers)
 	mux.HandleFunc("/cluster/leader", e.HandleLeader(c.Members))
 	mux.HandleFunc("/cluster/replicate", apiServer.HandleReplicate)
+	mux.HandleFunc("/cluster/catchup", apiServer.HandleCatchup)
 	mux.HandleFunc("/cluster/replication", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

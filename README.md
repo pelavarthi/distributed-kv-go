@@ -57,9 +57,24 @@ majority of nodes hold it, then tells the followers the write
 committed so they apply it too. A write to a follower answers
 503, and a write that cannot reach a majority is left
 uncommitted and never applied. Check the state with
-`GET /cluster/replication`. A follower that missed earlier
-entries rejects a new one until it catches up, which is the
-next chunk's job.
+`GET /cluster/replication`.
+
+Failover and follower catch-up:
+
+When the leader goes quiet, the next-highest alive member takes
+over and can keep accepting writes. A follower that missed
+entries — it was down, or it joined late — is caught up by the
+leader resending the missing suffix, stepping back one entry at
+a time if the follower's tail conflicts, until the two logs
+agree. A write also triggers a catch-up on the spot when a
+follower rejects it for a gap. Run it on demand with
+`kvctl catchup` or `POST /cluster/catchup` on the leader: it
+also re-drives any uncommitted tail, so a write the old leader
+replicated but never committed gets its chance to commit under
+the new leader. One honest limit: the replication log lives in
+memory, so a restarted node comes back with an empty log and
+must be caught up by the current leader before it is trusted
+with the log again.
 
 ```
 go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -peers http://localhost:8081

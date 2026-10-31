@@ -107,3 +107,91 @@ func TestReplicatedPutReachesFollower(t *testing.T) {
 		t.Fatal("follower still has deleted key")
 	}
 }
+
+func TestCatchupBringsLateFollowerUpToDate(t *testing.T) {
+	// A follower that joins after writes have already committed.
+	followerStore := store.New()
+	t.Cleanup(followerStore.Close)
+	followerRepl := replication.New("node2")
+	followerRepl.SetApply(applyToStore(followerStore))
+	followerSrv := httptest.NewServer(NewWithReplication(followerStore, nil, followerRepl, func() (bool, int) { return false, 1 }))
+	defer followerSrv.Close()
+
+	leaderStore := store.New()
+	t.Cleanup(leaderStore.Close)
+	leaderRepl := replication.New("node1")
+	leaderRepl.SetApply(applyToStore(leaderStore))
+	peers := []string{followerSrv.URL}
+	leaderRepl.SetPeers(func() []string { return peers })
+	leaderRepl.SetSender(func(addr string, req replication.AppendRequest) (replication.AppendResponse, error) {
+		body, _ := json.Marshal(req)
+		resp, err := http.Post(addr+"/cluster/replicate", "application/json", bytes.NewReader(body))
+		if err != nil {
+			return replication.AppendResponse{}, err
+		}
+		defer resp.Body.Close()
+		var out replication.AppendResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return replication.AppendResponse{}, err
+		}
+		return out, nil
+	})
+	leaderSrv := httptest.NewServer(NewWithReplication(leaderStore, nil, leaderRepl, func() (bool, int) { return true, 1 }))
+	defer leaderSrv.Close()
+
+	put := func(srv, key, value string) {
+		req, _ := http.NewRequest(http.MethodPut, srv+"/kv/"+key, strings.NewReader(`{"value":"`+value+`"}`))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("PUT %s = %d, want 201", key, resp.StatusCode)
+		}
+	}
+	put(leaderSrv.URL, "a", "1")
+	put(leaderSrv.URL, "b", "2")
+
+	// A second follower starts now, with an empty log.
+	lateStore := store.New()
+	t.Cleanup(lateStore.Close)
+	lateRepl := replication.New("node3")
+	lateRepl.SetApply(applyToStore(lateStore))
+	lateSrv := httptest.NewServer(NewWithReplication(lateStore, nil, lateRepl, func() (bool, int) { return false, 1 }))
+	defer lateSrv.Close()
+	peers = append(peers, lateSrv.URL)
+
+	resp, err := http.Post(leaderSrv.URL+"/cluster/catchup", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /cluster/catchup = %d, want 200", resp.StatusCode)
+	}
+	for _, kv := range [][2]string{{"a", "1"}, {"b", "2"}} {
+		resp, err := http.Get(lateSrv.URL + "/kv/" + kv[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got keyResponse
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got.Value != kv[1] {
+			t.Fatalf("late follower %s = %q, want %q", kv[0], got.Value, kv[1])
+		}
+	}
+
+	// Catch-up on a follower is refused, so only the leader runs it.
+	resp, err = http.Post(followerSrv.URL+"/cluster/catchup", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("POST /cluster/catchup on follower = %d, want 503", resp.StatusCode)
+	}
+}

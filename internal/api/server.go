@@ -63,6 +63,7 @@ func NewWithReplication(s *store.Store, log *wal.Log, repl *replication.Replicat
 	srv.repl = repl
 	srv.leader = leader
 	srv.mux.HandleFunc("/cluster/replicate", srv.handleReplicate)
+	srv.mux.HandleFunc("/cluster/catchup", srv.handleCatchup)
 	return srv
 }
 
@@ -71,6 +72,41 @@ func NewWithReplication(s *store.Store, log *wal.Log, repl *replication.Replicat
 // cluster endpoints, so a replicator can be reached directly.
 func (s *Server) HandleReplicate(w http.ResponseWriter, r *http.Request) {
 	s.handleReplicate(w, r)
+}
+
+// HandleCatchup serves POST /cluster/catchup for the leader. It
+// is also registered by the server binary alongside the other
+// cluster endpoints.
+func (s *Server) HandleCatchup(w http.ResponseWriter, r *http.Request) {
+	s.handleCatchup(w, r)
+}
+
+type catchupResponse struct {
+	Synced      int    `json:"synced_followers"`
+	CommitIndex uint64 `json:"commit_index"`
+}
+
+// handleCatchup pushes missing log entries to every follower and
+// re-drives any uncommitted tail, so a rejoined follower or a new
+// leader after failover can close gaps on demand instead of
+// waiting for the next write. Only the leader may run it.
+func (s *Server) handleCatchup(w http.ResponseWriter, r *http.Request) {
+	if s.repl == nil {
+		writeError(w, http.StatusNotFound, "replication is not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	term, ok := s.checkLeader(w)
+	if !ok {
+		return
+	}
+	s.repl.NoteTerm(term)
+	synced := s.repl.CatchUp()
+	commit := s.repl.Redrive()
+	writeJSON(w, http.StatusOK, catchupResponse{Synced: synced, CommitIndex: commit})
 }
 
 func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {

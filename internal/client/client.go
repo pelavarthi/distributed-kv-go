@@ -152,6 +152,30 @@ func (c *Client) Leader() (Leader, error) {
 	return out, nil
 }
 
+// CatchupResult is the leader's answer from /cluster/catchup.
+type CatchupResult struct {
+	Synced      int    `json:"synced_followers"`
+	CommitIndex uint64 `json:"commit_index"`
+}
+
+// Catchup asks the leader to push missing log entries to its
+// followers and re-drive any uncommitted tail.
+func (c *Client) Catchup() (CatchupResult, error) {
+	req, err := http.NewRequest(http.MethodPost, c.base+"/cluster/catchup", nil)
+	if err != nil {
+		return CatchupResult{}, err
+	}
+	body, _, err := c.do(req)
+	if err != nil {
+		return CatchupResult{}, err
+	}
+	var out CatchupResult
+	if err := json.Unmarshal(body, &out); err != nil {
+		return CatchupResult{}, err
+	}
+	return out, nil
+}
+
 func (c *Client) Health() error {
 	req, err := http.NewRequest(http.MethodGet, c.base+"/health", nil)
 	if err != nil {

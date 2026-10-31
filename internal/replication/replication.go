@@ -8,15 +8,22 @@
 //
 // A write that cannot reach a majority is left uncommitted in the
 // log and never applied, so a lone leader cannot pretend a write
-// is durable. This chunk sends only the newest entry, so a follower
-// that missed earlier entries rejects the append until it catches
-// up; that catch-up is the next chunk's job.
+// is durable. When a follower missed entries — it was down, or it
+// joined late — the leader catches it up by resending the missing
+// suffix, stepping back one entry at a time if the follower's tail
+// conflicts, until the two logs agree. After a failover, the new
+// leader re-drives its uncommitted tail the same way, so a write
+// the old leader replicated but never committed gets its chance
+// to commit instead of sitting in the log forever.
 package replication
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
+
+var errNoSender = errors.New("no sender configured")
 
 const (
 	OpSet    = "set"
@@ -87,6 +94,17 @@ func (r *Replicator) SetApply(apply Apply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.apply = apply
+}
+
+// NoteTerm adopts a newer term, for example when this node wins an
+// election. It never moves the term backwards: a stale leader's
+// appends are still rejected by followers that have seen newer.
+func (r *Replicator) NoteTerm(term int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if term > r.term {
+		r.term = term
+	}
 }
 
 // SetSender registers how append requests reach followers.
@@ -182,11 +200,108 @@ func (r *Replicator) Commit(index uint64) {
 	r.applyUpTo(r.commitIndex)
 }
 
+// batchFrom returns the entries from start through upTo, plus the
+// index and term of the entry just before them, for one append
+// request. The caller must hold the lock.
+func (r *Replicator) batchFrom(start, upTo uint64) (uint64, int, []Entry) {
+	prevIndex := start - 1
+	prevTerm := 0
+	if prevIndex > 0 {
+		if prev, ok := r.entryAt(prevIndex); ok {
+			prevTerm = prev.Term
+		}
+	}
+	var entries []Entry
+	for i := start; i <= upTo; i++ {
+		if e, ok := r.entryAt(i); ok {
+			entries = append(entries, e)
+		}
+	}
+	return prevIndex, prevTerm, entries
+}
+
+// sendBatch sends entries start through upTo to one follower.
+func (r *Replicator) sendBatch(addr string, start, upTo uint64) (AppendResponse, error) {
+	r.mu.Lock()
+	sender := r.sender
+	prevIndex, prevTerm, entries := r.batchFrom(start, upTo)
+	req := AppendRequest{
+		Term:         r.term,
+		Leader:       r.selfID,
+		PrevIndex:    prevIndex,
+		PrevTerm:     prevTerm,
+		Entries:      entries,
+		LeaderCommit: r.commitIndex,
+	}
+	r.mu.Unlock()
+	if sender == nil {
+		return AppendResponse{}, errNoSender
+	}
+	return sender(addr, req)
+}
+
+// catchUpPeer brings one follower up to upTo. It first probes the
+// follower with an empty append at upTo: a follower that already
+// holds that prefix answers success, and one that does not reports
+// how far its log reaches. It then resends from there, stepping
+// back one entry at a time when the follower's tail conflicts,
+// because the first entry that disagrees has to be replaced, not
+// just the entries after it. Sending from index 1 always works
+// when the follower is reachable, since there is no previous
+// entry to disagree about, so the loop is guaranteed to finish.
+func (r *Replicator) catchUpPeer(addr string, upTo uint64) bool {
+	if upTo == 0 {
+		return true
+	}
+	r.mu.Lock()
+	term := r.term
+	commit := r.commitIndex
+	lastTerm := 0
+	if e, ok := r.entryAt(upTo); ok {
+		lastTerm = e.Term
+	}
+	sender := r.sender
+	r.mu.Unlock()
+	if sender == nil {
+		return false
+	}
+	probe := AppendRequest{
+		Term: term, Leader: r.selfID,
+		PrevIndex: upTo, PrevTerm: lastTerm, LeaderCommit: commit,
+	}
+	resp, err := sender(addr, probe)
+	if err != nil {
+		return false
+	}
+	if resp.Success {
+		return true
+	}
+	start := resp.MatchIndex
+	if start > upTo {
+		start = upTo
+	}
+	if start < 1 {
+		start = 1
+	}
+	for s := start; s >= 1; s-- {
+		resp, err := r.sendBatch(addr, s, upTo)
+		if err != nil {
+			return false
+		}
+		if resp.Success && resp.MatchIndex >= upTo {
+			return true
+		}
+	}
+	return false
+}
+
 // Replicate sends the entry at index to every alive follower and
 // reports whether a majority of nodes now hold it. The leader
 // itself counts as one vote, so a single-node cluster always
 // commits. A follower that already holds the entry, or holds a
-// later one, counts as an acknowledgement.
+// later one, counts as an acknowledgement. A follower that rejects
+// the entry because it missed earlier ones is caught up on the
+// spot, instead of leaving the write stuck behind the gap.
 func (r *Replicator) Replicate(index uint64) bool {
 	r.mu.Lock()
 	entry, ok := r.entryAt(index)
@@ -231,10 +346,62 @@ func (r *Replicator) Replicate(index uint64) bool {
 		}
 		if resp.Success && resp.MatchIndex >= index {
 			acks++
+			continue
+		}
+		if r.catchUpPeer(addr, index) {
+			acks++
 		}
 	}
 	// Majority of the whole cluster, leader included.
 	return acks*2 > len(peers)+1
+}
+
+// CatchUp pushes the whole log to every alive follower that is
+// behind, and reports how many followers ended up in sync. A
+// follower that is down is skipped, not counted, and retried on
+// the next write or the next catch-up. This is what a rejoined
+// follower, or a new leader after failover, runs to close gaps
+// without waiting for the next write to trip over them.
+func (r *Replicator) CatchUp() int {
+	r.mu.Lock()
+	peersFn := r.peers
+	last := uint64(len(r.entries))
+	r.mu.Unlock()
+	if peersFn == nil {
+		return 0
+	}
+	synced := 0
+	for _, addr := range peersFn() {
+		if r.catchUpPeer(addr, last) {
+			synced++
+		}
+	}
+	return synced
+}
+
+// Redrive re-replicates every uncommitted entry, in order, and
+// commits each one that reaches a majority, then tells followers
+// the new commit index. A new leader runs this after failover:
+// entries the old leader sent to followers but never committed
+// are still in this log, and without a re-drive they would sit
+// unapplied forever. It stops at the first entry that cannot
+// reach a majority, since later entries cannot commit before it.
+func (r *Replicator) Redrive() uint64 {
+	for {
+		r.mu.Lock()
+		next := r.commitIndex + 1
+		last := uint64(len(r.entries))
+		r.mu.Unlock()
+		if next > last {
+			break
+		}
+		if !r.Replicate(next) {
+			break
+		}
+		r.Commit(next)
+	}
+	r.SyncCommit()
+	return r.CommitIndex()
 }
 
 // SyncCommit tells followers the current commit index, with no

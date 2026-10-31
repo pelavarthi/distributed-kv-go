@@ -15,7 +15,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: kvctl [-addr URL] [-ttl SECONDS] <get|set|delete|list|members|leader> [key] [value]")
+		fmt.Fprintln(os.Stderr, "usage: kvctl [-addr URL] [-ttl SECONDS] <get|set|delete|list|members|leader|catchup> [key] [value]")
 		os.Exit(2)
 	}
 	c := client.New(*addr)
@@ -56,6 +56,12 @@ func main() {
 		leader, err = c.Leader()
 		if err == nil {
 			fmt.Printf("%s term %d\n", leader.ID, leader.Term)
+		}
+	case "catchup":
+		var res client.CatchupResult
+		res, err = c.Catchup()
+		if err == nil {
+			fmt.Printf("synced %d followers, commit index %d\n", res.Synced, res.CommitIndex)
 		}
 	case "members":
 		var members []client.Member
