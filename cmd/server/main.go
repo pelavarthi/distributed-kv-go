@@ -4,7 +4,10 @@
 // without replaying the whole history every time. With -peers it
 // also joins a cluster: it heartbeats its peers and serves its
 // membership list, so nodes can tell when one has gone quiet,
-// and the alive member with the highest id is the leader.
+// and the alive member with the highest id is the leader. Keys
+// are sharded across the alive members with a consistent hash
+// ring, so reads for a key are forwarded to the node that owns
+// it, and GET /kv lists only this node's keys.
 package main
 
 import (
@@ -21,6 +24,7 @@ import (
 	"github.com/pelavarthi/distributed-kv-go/internal/cluster"
 	"github.com/pelavarthi/distributed-kv-go/internal/election"
 	"github.com/pelavarthi/distributed-kv-go/internal/replication"
+	"github.com/pelavarthi/distributed-kv-go/internal/sharding"
 	"github.com/pelavarthi/distributed-kv-go/internal/snapshot"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 	"github.com/pelavarthi/distributed-kv-go/internal/wal"
@@ -113,10 +117,26 @@ func main() {
 	}
 	apiServer := api.NewWithReplication(s, l, repl, leaderFn)
 
+	// Sharding: the ring is built from the alive members, so a
+	// node joining or going quiet reshards the keys it owned
+	// without moving anyone else's.
+	shardRouter := sharding.NewRouter(*advertise, sharding.DefaultReplicas, func() []string {
+		var addrs []string
+		for _, m := range c.Members() {
+			if m.Alive {
+				addrs = append(addrs, m.Addr)
+			}
+		}
+		return addrs
+	})
+	apiServer.SetShardRouter(shardRouter)
+
 	mux := http.NewServeMux()
 	mux.Handle("/", apiServer)
 	mux.HandleFunc("/cluster/heartbeat", c.HandleHeartbeat)
 	mux.HandleFunc("/cluster/members", c.HandleMembers)
+	mux.HandleFunc("/cluster/shards", shardRouter.HandleShards)
+	mux.HandleFunc("/cluster/route", shardRouter.HandleRoute)
 	mux.HandleFunc("/cluster/leader", e.HandleLeader(c.Members))
 	mux.HandleFunc("/cluster/replicate", apiServer.HandleReplicate)
 	mux.HandleFunc("/cluster/catchup", apiServer.HandleCatchup)

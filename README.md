@@ -76,6 +76,20 @@ memory, so a restarted node comes back with an empty log and
 must be caught up by the current leader before it is trusted
 with the log again.
 
+Sharding with consistent hashing:
+
+Keys are assigned to nodes on a consistent hash ring, with 100
+virtual points per node so the split stays roughly even. Adding
+a node only moves the keys that land on its part of the ring,
+and removing one hands its keys to the next node clockwise.
+Reads for a key are forwarded to its owner, and `GET /kv` lists
+only the keys this node owns. Check the ring with
+`GET /cluster/shards` and a key's owner with
+`GET /cluster/route?key=hello`. One honest limit: writes still
+go through the single leader, because replication is
+cluster-wide for now, so sharding currently routes reads, not
+write ownership.
+
 ```
 go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -peers http://localhost:8081
 go run ./cmd/server -id node2 -listen :8081 -advertise http://localhost:8081 -peers http://localhost:8080 -data-dir data2

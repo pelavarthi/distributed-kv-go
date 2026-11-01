@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pelavarthi/distributed-kv-go/internal/replication"
+	"github.com/pelavarthi/distributed-kv-go/internal/sharding"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 	"github.com/pelavarthi/distributed-kv-go/internal/wal"
 )
@@ -39,6 +40,7 @@ type Server struct {
 	mux    *http.ServeMux
 	repl   *replication.Replicator
 	leader func() (bool, int) // isLeader, term
+	shard  *sharding.Router
 }
 
 func New(s *store.Store) *Server {
@@ -65,6 +67,16 @@ func NewWithReplication(s *store.Store, log *wal.Log, repl *replication.Replicat
 	srv.mux.HandleFunc("/cluster/replicate", srv.handleReplicate)
 	srv.mux.HandleFunc("/cluster/catchup", srv.handleCatchup)
 	return srv
+}
+
+// SetShardRouter turns on shard routing for reads. A GET for a key
+// this node does not own is forwarded to its owner, and GET /kv
+// lists only this node's keys. Writes are not forwarded: they
+// still go through the leader, because replication is cluster-wide
+// for now, and a write forwarded to a non-leader owner would only
+// come back 503.
+func (s *Server) SetShardRouter(r *sharding.Router) {
+	s.shard = r
 }
 
 // HandleReplicate serves POST /cluster/replicate for followers.
@@ -153,13 +165,26 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string][]string{"keys": s.store.Keys()})
+	keys := s.store.Keys()
+	if s.shard != nil {
+		owned := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if s.shard.IsLocal(key) {
+				owned = append(owned, key)
+			}
+		}
+		keys = owned
+	}
+	writeJSON(w, http.StatusOK, map[string][]string{"keys": keys})
 }
 
 func (s *Server) handleKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	if r.Method == http.MethodGet && s.shard != nil && s.shard.Forward(w, r, key) {
 		return
 	}
 	switch r.Method {
