@@ -15,14 +15,18 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/pelavarthi/distributed-kv-go/internal/api"
 	"github.com/pelavarthi/distributed-kv-go/internal/cluster"
 	"github.com/pelavarthi/distributed-kv-go/internal/election"
+	"github.com/pelavarthi/distributed-kv-go/internal/grpckv"
 	"github.com/pelavarthi/distributed-kv-go/internal/replication"
 	"github.com/pelavarthi/distributed-kv-go/internal/sharding"
 	"github.com/pelavarthi/distributed-kv-go/internal/snapshot"
@@ -33,6 +37,7 @@ import (
 func main() {
 	dataDir := flag.String("data-dir", "data", "directory holding the store data")
 	listen := flag.String("listen", ":8080", "address to listen on")
+	grpcListen := flag.String("grpc-listen", "", "address to serve gRPC on, e.g. :9090; empty means no gRPC server")
 	nodeID := flag.String("id", "node1", "this node's id")
 	advertise := flag.String("advertise", "http://localhost:8080", "this node's address as peers see it")
 	peers := flag.String("peers", "", "comma-separated peer addresses, e.g. http://localhost:8081,http://localhost:8082")
@@ -149,6 +154,21 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(repl.Status(leader))
 	})
+
+	// gRPC serves the same store on a second port when asked.
+	// It reads from the store directly, so it is a second
+	// transport, not a second write path: replicated writes
+	// still go through the HTTP leader.
+	if *grpcListen != "" {
+		lis, err := net.Listen("tcp", *grpcListen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		grpcSrv := grpc.NewServer()
+		grpckv.Register(grpcSrv, s)
+		go grpcSrv.Serve(lis)
+		log.Printf("node %s serving gRPC on %s", *nodeID, *grpcListen)
+	}
 
 	log.Printf("node %s listening on %s, peers: %v", *nodeID, *listen, peerAddrs)
 	if err := http.ListenAndServe(*listen, mux); err != nil {

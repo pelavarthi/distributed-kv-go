@@ -95,6 +95,29 @@ go run ./cmd/server -id node1 -listen :8080 -advertise http://localhost:8080 -pe
 go run ./cmd/server -id node2 -listen :8081 -advertise http://localhost:8081 -peers http://localhost:8080 -data-dir data2
 ```
 
+gRPC client and multi-node end-to-end test:
+
+The store is also served over gRPC on a second port, with the
+same Get, Set, Delete, and List operations. Messages are
+encoded as JSON over gRPC, so there is no code-generation step.
+Start a node with gRPC on, then use the client:
+
+```
+go run ./cmd/server -grpc-listen :9090
+go run ./cmd/kvgrpc -addr localhost:9090 set hello world
+go run ./cmd/kvgrpc -addr localhost:9090 get hello
+```
+
+One honest limit: a gRPC write touches only that one node's
+memory, it is not written to the WAL and not replicated, so
+replicated writes still go through the HTTP leader path. gRPC
+reads serve from the same store, so a committed write is
+visible over gRPC right away. The three-node end-to-end test in
+`internal/api/cluster_test.go` covers the whole path: a write
+refused by a follower, committed through the leader, readable
+on both followers, still committing with one follower down,
+deleted everywhere, and readable over gRPC on the leader.
+
 ```
 POST /cluster/heartbeat  {"id": "node1", "addr": "http://localhost:8080"}
 GET /cluster/members
