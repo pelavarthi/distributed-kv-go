@@ -15,8 +15,10 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/pelavarthi/distributed-kv-go/internal/cluster"
 	"github.com/pelavarthi/distributed-kv-go/internal/election"
 	"github.com/pelavarthi/distributed-kv-go/internal/grpckv"
+	"github.com/pelavarthi/distributed-kv-go/internal/metrics"
 	"github.com/pelavarthi/distributed-kv-go/internal/replication"
 	"github.com/pelavarthi/distributed-kv-go/internal/sharding"
 	"github.com/pelavarthi/distributed-kv-go/internal/snapshot"
@@ -43,7 +46,12 @@ func main() {
 	peers := flag.String("peers", "", "comma-separated peer addresses, e.g. http://localhost:8081,http://localhost:8082")
 	interval := flag.Duration("heartbeat-interval", time.Second, "how often to heartbeat peers")
 	timeout := flag.Duration("heartbeat-timeout", 3*time.Second, "how long without a heartbeat before a peer counts as dead")
+	logJSON := flag.Bool("log-json", false, "log requests as JSON instead of text, for log aggregation")
 	flag.Parse()
+
+	if *logJSON {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	}
 
 	s := store.New()
 	defer s.Close()
@@ -121,6 +129,7 @@ func main() {
 		return e.IsLeader(), term
 	}
 	apiServer := api.NewWithReplication(s, l, repl, leaderFn)
+	apiServer.SetMetrics(metrics.New())
 
 	// Sharding: the ring is built from the alive members, so a
 	// node joining or going quiet reshards the keys it owned

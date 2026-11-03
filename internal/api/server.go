@@ -4,10 +4,12 @@ package api
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/pelavarthi/distributed-kv-go/internal/metrics"
 	"github.com/pelavarthi/distributed-kv-go/internal/replication"
 	"github.com/pelavarthi/distributed-kv-go/internal/sharding"
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
@@ -35,12 +37,13 @@ type errorResponse struct {
 // majority of nodes hold it. Reads still serve from the local
 // store, which holds every committed write.
 type Server struct {
-	store  *store.Store
-	log    *wal.Log
-	mux    *http.ServeMux
-	repl   *replication.Replicator
-	leader func() (bool, int) // isLeader, term
-	shard  *sharding.Router
+	store   *store.Store
+	log     *wal.Log
+	mux     *http.ServeMux
+	repl    *replication.Replicator
+	leader  func() (bool, int) // isLeader, term
+	shard   *sharding.Router
+	metrics *metrics.Metrics
 }
 
 func New(s *store.Store) *Server {
@@ -138,8 +141,25 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.repl.Receive(req))
 }
 
+// ServeHTTP routes the request and, when metrics are set, records
+// its status and duration and logs one structured line per
+// request, so a slow or failing route shows up in both places.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	if s.metrics == nil {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	start := time.Now()
+	rw := &statusWriter{ResponseWriter: w}
+	s.mux.ServeHTTP(rw, r)
+	dur := time.Since(start)
+	route := routePattern(r.URL.Path)
+	s.metrics.RecordRequest(r.Method, route, rw.status, dur)
+	slog.Info("request",
+		"method", r.Method,
+		"route", route,
+		"status", rw.status,
+		"duration_ms", dur.Milliseconds())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -122,3 +122,24 @@ deleted everywhere, and readable over gRPC on the leader.
 POST /cluster/heartbeat  {"id": "node1", "addr": "http://localhost:8080"}
 GET /cluster/members
 ```
+
+Metrics and logging:
+
+Every request through the API is counted by method, route, and
+status, with its latency folded into a per-route average, and
+one structured log line is written per request (method, route,
+status, duration). Routes are collapsed, so `/kv/hello` and
+`/kv/world` both count as `/kv/:key` instead of one counter
+per key. Check it with `GET /metrics`:
+
+```
+GET /metrics
+{"requests":{"PUT /kv/:key 201":1,"GET /kv/:key 404":1},
+ "latencies":{"PUT /kv/:key":{"count":1,"total_ms":0.4,"avg_ms":0.4}},
+ "counters":{}}
+```
+
+Start the server with `-log-json` to write those request lines
+as JSON, for log aggregation, instead of the default text
+format. The counters map is there for non-request events, such
+as replication commits, which later work can record.
