@@ -143,3 +143,23 @@ Start the server with `-log-json` to write those request lines
 as JSON, for log aggregation, instead of the default text
 format. The counters map is there for non-request events, such
 as replication commits, which later work can record.
+
+Chaos and partition safety:
+
+A majority must be counted against the whole cluster, not just
+the followers that are still answering. Before this fix, a
+leader cut off from both followers in a 3-node cluster saw no
+alive peers and committed on its own, so the minority side and
+the majority side could each commit a different value for the
+same key. Now the server tells the replicator the full
+membership count, including dead members, and a write with no
+followers reachable only commits in a real one-node cluster.
+A partitioned leader's write stays uncommitted and unapplied,
+and a failed write answers 503 so the client retries on a node
+that can still reach a majority. When the cut node returns,
+`POST /cluster/catchup` on the leader resends the missing
+entries and replaces any stale value the minority side wrote.
+The `internal/chaos` package is a test-only fault injector that
+drops traffic to cut-off nodes, so the partition scenarios in
+`internal/replication/partition_test.go` and
+`internal/chaos/chaos_test.go` run without real servers.

@@ -82,6 +82,7 @@ type Replicator struct {
 	apply       Apply
 	sender      Sender
 	peers       func() []string // alive follower addresses
+	clusterSize func() int      // whole cluster, alive or not; 0 means unknown
 }
 
 // New builds a replicator with no entries and no commit yet.
@@ -119,6 +120,19 @@ func (r *Replicator) SetPeers(peers func() []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.peers = peers
+}
+
+// SetClusterSize registers how the whole cluster is counted,
+// including dead members. A majority must be counted against this
+// number, not against the alive followers: a leader cut off from
+// the rest of the cluster sees no alive peers, and counting only
+// those would let a single node commit writes the majority never
+// saw. When no size is registered, Replicate falls back to
+// counting the alive followers plus this node, as before.
+func (r *Replicator) SetClusterSize(size func() int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clusterSize = size
 }
 
 // Append adds an entry to this node's log and returns its index.
@@ -311,6 +325,7 @@ func (r *Replicator) Replicate(index uint64) bool {
 	}
 	sender := r.sender
 	peersFn := r.peers
+	sizeFn := r.clusterSize
 	prevIndex := index - 1
 	prevTerm := 0
 	if prevIndex > 0 {
@@ -326,8 +341,21 @@ func (r *Replicator) Replicate(index uint64) bool {
 	if peersFn != nil {
 		peers = peersFn()
 	}
+	// Majority of the whole cluster, leader included. A cluster
+	// size is only trusted when it at least covers this node and
+	// the followers it can see; anything smaller is a stale view
+	// and must not shrink the majority.
+	total := len(peers) + 1
+	if sizeFn != nil {
+		if n := sizeFn(); n >= total {
+			total = n
+		}
+	}
 	if sender == nil || len(peers) == 0 {
-		return true
+		// No followers reachable: only a one-node cluster can
+		// commit on its own. A partitioned leader in a bigger
+		// cluster must leave the write uncommitted.
+		return total == 1
 	}
 
 	req := AppendRequest{
@@ -353,7 +381,7 @@ func (r *Replicator) Replicate(index uint64) bool {
 		}
 	}
 	// Majority of the whole cluster, leader included.
-	return acks*2 > len(peers)+1
+	return acks*2 > total
 }
 
 // CatchUp pushes the whole log to every alive follower that is

@@ -103,6 +103,13 @@ func main() {
 		}
 		return addrs
 	})
+	// Majority is counted against every known member, dead or
+	// alive, not just the alive peers above: after a partition
+	// the alive list shrinks, and counting only it would let a
+	// lone leader commit writes the rest of the cluster never saw.
+	repl.SetClusterSize(func() int {
+		return len(c.Members())
+	})
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	repl.SetSender(func(addr string, req replication.AppendRequest) (replication.AppendResponse, error) {
 		body, _ := json.Marshal(req)
