@@ -10,7 +10,7 @@ import (
 	"github.com/pelavarthi/distributed-kv-go/internal/store"
 )
 
-func newTestServer(t *testing.T) *httptest.Server {
+func newTestServer(t testing.TB) *httptest.Server {
 	t.Helper()
 	s := store.New()
 	t.Cleanup(s.Close)

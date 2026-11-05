@@ -97,7 +97,10 @@ func (l *Log) append(rec Record) error {
 	}
 	// Sync before the caller applies the change in memory, so a
 	// crash right after this returns cannot lose the record.
-	return l.file.Sync()
+	// On Linux this is fdatasync, which skips file metadata an
+	// append-only log never reads back; elsewhere it is a
+	// plain fsync.
+	return syncFile(l.file)
 }
 
 // AppendSet logs a set. A ttl of zero or less means no expiry.

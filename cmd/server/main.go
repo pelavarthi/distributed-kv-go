@@ -186,8 +186,18 @@ func main() {
 		log.Printf("node %s serving gRPC on %s", *nodeID, *grpcListen)
 	}
 
+	// Timeouts bound how long a slow or stuck client can hold a
+	// connection: without them one client sending a header a
+	// byte an hour can tie up a handler slot forever.
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("node %s listening on %s, peers: %v", *nodeID, *listen, peerAddrs)
-	if err := http.ListenAndServe(*listen, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

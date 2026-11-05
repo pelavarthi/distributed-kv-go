@@ -159,6 +159,63 @@ and a failed write answers 503 so the client retries on a node
 that can still reach a majority. When the cut node returns,
 `POST /cluster/catchup` on the leader resends the missing
 entries and replaces any stale value the minority side wrote.
+Benchmarks and tuning:
+
+Go benchmarks cover the hot paths, so a change can be judged
+by a number instead of a feeling:
+
+```
+go test ./internal/store/ ./internal/wal/ -bench . -benchtime 100000x
+go test ./internal/api/ -bench . -benchtime 10000x
+```
+
+On this machine the in-memory store does a Set in about
+600 ns and a Get in about 170 ns. A durable WAL append is
+about 4-6 µs, and that is the write ceiling for a single
+node: every write syncs to disk before it is applied, and
+concurrent writers do not help because the syncs serialize
+on the disk. The HTTP path, without the WAL, serves a GET in
+about 60 µs. Numbers measured on this machine; re-run them
+on yours before trusting them.
+
+`cmd/kvbench` is a load generator for a running server. It
+seeds the key space, then hammers it with N workers and
+prints throughput and p50/p95/p99 latencies:
+
+```
+go run ./cmd/kvbench -n 20000 -c 20 -reads 80
+```
+
+Against a single node with the WAL on, that run did about
+7,700 requests a second with p50 1.7 ms and p95 5.8 ms, and
+a writes-only run did about 7,200 a second with p50 0.5 ms.
+Writes are slower than reads because each one waits for the
+disk sync; reads only touch memory.
+
+Two tunings came out of measuring:
+
+- The WAL syncs with fdatasync on Linux instead of a full
+  fsync. An append-only log never reads its own file
+  metadata back, so skipping the metadata flush is free
+  durability-wise. On this machine the disk sync is already
+  nearly free, so the benchmarks show no reliable difference
+  (3.8-5.8 µs per append either way); the change is kept
+  because it is the right default on a real disk, and a
+  restart after the load test still replayed all 10,933
+  records. Other platforms still use fsync.
+- The HTTP server now has timeouts: 5 seconds to send
+  request headers, 10 seconds to write a response, 120
+  seconds of idle keep-alive. Without them one slow client
+  can hold a handler slot forever.
+
+One thing deliberately not done: parallel reads are about
+3x slower per operation than single-threaded reads, because
+every goroutine contends on the store's one RWMutex. A
+striped store with a lock per shard would fix that, but
+in-memory ops are already sub-microsecond and the HTTP
+round trip dominates, so it is not worth the complexity
+until reads are actually the bottleneck.
+
 The `internal/chaos` package is a test-only fault injector that
 drops traffic to cut-off nodes, so the partition scenarios in
 `internal/replication/partition_test.go` and
