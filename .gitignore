@@ -1,0 +1,15 @@
+# node data directories (WAL + snapshots)
+/data
+/data1
+/data2
+/data3
+/demo-data
+
+# built binaries
+/bin/
+/server
+/kvctl
+/kvgrpc
+/kvbench
+
+*.log
